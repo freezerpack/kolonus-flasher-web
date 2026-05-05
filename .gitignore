@@ -10,6 +10,5 @@ Thumbs.db
 # Logs
 *.log
 
-# Firmware binarios — no comitear .bin grandes a menos que se quiera distribuir
-# (Si se quiere firmware embebido, mover a /firmware/ y comentar esta línea)
-firmware/*.bin
+# Firmwares oficiales Kolonus SÍ se comitean al repo (los sirve GitHub Pages)
+# Si en el futuro se quieren ignorar archivos puntuales, se puede listar aquí.

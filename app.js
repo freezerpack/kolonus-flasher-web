@@ -1,6 +1,12 @@
-// Kolonus ESP32-C3 Flasher (Web Edition)
-// Basado en flash.html del APK KolonusFlasher v2.4.0
+// Kolonus ESP32-C3 Flasher (Web Edition v2.0.0)
 // https://github.com/freezerpack/kolonus-flasher-web
+//
+// Diferencias clave vs el oficial de esptool-js:
+//  - Dropdown de firmwares pre-cargados con offset embebido (poka-yoke):
+//    Marco selecciona "Kolonus QR Reader v1.3.8" y NO escribe ningún offset.
+//  - "🚨 Modo recuperación" para ESP32 brickeados (boot loop por bootloader corrupto).
+//  - Baudrate forzado a 115200 (cambiar a 921600 falla con USB-CDC nativo del C3).
+//  - Modo avanzado oculto detrás de un toggle para los casos custom.
 
 import { SerialPort as WebSerialPolyfill }
     from 'https://unpkg.com/web-serial-polyfill@1.0.15/dist/serial.js';
@@ -8,14 +14,15 @@ import { ESPLoader, Transport }
     from 'https://unpkg.com/esptool-js@0.5.4/bundle.js';
 
 // ─── Config ─────────────────────────────────────────────────────────
-const BAUD_RATE = 115200;
-const STORAGE_KEY_OFFSET = 'kolonus_flash_offset';
+const BAUD_RATE = 115200;  // FIJO. NO cambiar — 921600 falla con USB-CDC nativo del C3.
+const FIRMWARES_JSON = 'firmwares.json';
 
 // VID conocidos para ESP32-C3 y variantes
 const USB_FILTERS = [
     { vendorId: 0x303a },  // Espressif (ESP32-C3 USB-JTAG nativo)
     { vendorId: 0x10c4 },  // CP210x (Silicon Labs)
     { vendorId: 0x1a86 },  // CH340 (WCH)
+    { vendorId: 0x0403 },  // FTDI
 ];
 
 // ─── Estado ─────────────────────────────────────────────────────────
@@ -23,9 +30,13 @@ let port = null;
 let transport = null;
 let esploader = null;
 let chip = null;
-let firmwareData = null;
+let firmwareData = null;       // string binario
 let firmwareName = null;
+let firmwareOffset = null;
+let firmwareIsRecovery = false;
 let isConnected = false;
+
+let firmwareCatalog = [];      // [{id, name, file, offset, type, ...}]
 
 // ─── DOM refs ───────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -40,11 +51,10 @@ function log(message, type = 'info') {
     consoleEl.scrollTop = consoleEl.scrollHeight;
 }
 
-// Terminal que recibe esptool-js
 const espLoaderTerminal = {
-    clean()              { consoleEl.innerHTML = ''; },
-    writeLine(data)      { log(data, 'info'); },
-    write(data)          { log(data, 'info'); },
+    clean()         { consoleEl.innerHTML = ''; },
+    writeLine(data) { log(data, 'info'); },
+    write(data)     { log(data, 'info'); },
 };
 
 // ─── UI helpers ─────────────────────────────────────────────────────
@@ -65,15 +75,17 @@ function updateFlashButton() {
     $('btnFlash').disabled = !(isConnected && firmwareData);
 }
 
-function getSelectedOffset() {
-    return parseInt($('offsetSelect').value, 16);
-}
-
 function formatHex(num) {
     return '0x' + num.toString(16).toUpperCase().padStart(5, '0');
 }
 
-// ─── Compatibilidad del browser ─────────────────────────────────────
+function formatSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+}
+
+// ─── Compatibilidad ─────────────────────────────────────────────────
 function checkCompatibility() {
     const banner = $('compatBanner');
     if (!navigator.usb) {
@@ -93,98 +105,149 @@ function checkCompatibility() {
     return true;
 }
 
-// ─── Diagnóstico USB ────────────────────────────────────────────────
-// Muy útil para entender qué interfaces expone el dispositivo
-// y por cuál intenta hablar el polyfill. Crítico para debugging.
-async function runDiagnostic() {
-    log('━━━━━━ DIAGNÓSTICO USB ━━━━━━', 'warning');
+// ─── Carga del catálogo de firmwares ────────────────────────────────
+async function loadFirmwareCatalog() {
+    log('Cargando catálogo de firmwares...');
+    try {
+        const response = await fetch(FIRMWARES_JSON, { cache: 'no-store' });
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const data = await response.json();
+        firmwareCatalog = data.firmwares || [];
+        log(`✓ Catálogo cargado: ${firmwareCatalog.length} firmware(s)`, 'success');
+        if (data.lastUpdated) {
+            log(`  Última actualización: ${data.lastUpdated}`, 'debug');
+        }
+        populateFirmwareDropdown();
+    } catch (e) {
+        log('Error cargando firmwares.json: ' + e.message, 'error');
+        log('Solo modo avanzado disponible (archivo .bin custom).', 'warning');
+        $('firmwareSelect').innerHTML = '<option value="">— Sin catálogo (usa Modo avanzado) —</option>';
+    }
+}
 
-    if (!navigator.usb) {
-        log('navigator.usb no existe — WebUSB no soportado', 'error');
+function populateFirmwareDropdown() {
+    const select = $('firmwareSelect');
+    select.innerHTML = '<option value="">— Selecciona un firmware —</option>';
+
+    let defaultId = null;
+    for (const fw of firmwareCatalog) {
+        const opt = document.createElement('option');
+        opt.value = fw.id;
+        opt.textContent = fw.name;
+        select.appendChild(opt);
+        if (fw.default && !defaultId) defaultId = fw.id;
+    }
+
+    if (defaultId) {
+        select.value = defaultId;
+        onFirmwareSelectionChanged();
+    }
+}
+
+async function onFirmwareSelectionChanged() {
+    const select = $('firmwareSelect');
+    const fwId = select.value;
+    const desc = $('firmwareDescription');
+    const meta = $('firmwareMeta');
+
+    if (!fwId) {
+        desc.textContent = '';
+        meta.innerHTML = '';
+        firmwareData = null;
+        firmwareName = null;
+        firmwareOffset = null;
+        firmwareIsRecovery = false;
+        updateFlashButton();
         return;
     }
-    log('✓ navigator.usb disponible', 'success');
 
-    // Listar dispositivos previamente autorizados
+    const fw = firmwareCatalog.find(f => f.id === fwId);
+    if (!fw) return;
+
+    desc.textContent = fw.description || '';
+    meta.innerHTML =
+        `<span class="meta-item"><strong>Offset:</strong> ${fw.offsetHex}</span>` +
+        `<span class="meta-item"><strong>Tamaño:</strong> ${formatSize(fw.sizeBytes)}</span>` +
+        `<span class="meta-item"><strong>Tipo:</strong> ${fw.type}</span>`;
+
+    firmwareIsRecovery = (fw.type === 'recovery');
+    firmwareOffset = fw.offset;
+    firmwareName = fw.name;
+
+    // Descargar el .bin del repo
+    log(`Descargando ${fw.file}...`, 'info');
     try {
-        const devices = await navigator.usb.getDevices();
-        log(`Dispositivos previamente autorizados: ${devices.length}`, 'info');
-        devices.forEach((d, i) => {
-            log(`  [${i}] VID=0x${d.vendorId.toString(16)} PID=0x${d.productId.toString(16)} ${d.productName || ''}`, 'debug');
-        });
+        const response = await fetch(fw.file, { cache: 'force-cache' });
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const buffer = await response.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+
+        // esptool-js espera string binario
+        let binaryString = '';
+        const chunkSize = 0x8000;  // procesar en chunks para evitar stack overflow
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+            binaryString += String.fromCharCode.apply(
+                null, bytes.subarray(i, i + chunkSize)
+            );
+        }
+        firmwareData = binaryString;
+
+        log(`✓ Firmware cargado: ${fw.name}`, 'success');
+        log(`  ${formatSize(bytes.length)} → offset ${fw.offsetHex}`, 'debug');
+        if (firmwareIsRecovery) {
+            log('━━━━━━ MODO RECUPERACIÓN ━━━━━━', 'warning');
+            log('Este modo flashea el merge completo en 0x00000.', 'warning');
+            log('Si el ESP32 está en boot loop, esptool-js intentará', 'warning');
+            log('atrapar el chip entre resets. Puede tardar varios intentos.', 'warning');
+            log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', 'warning');
+        }
+        updateFlashButton();
     } catch (e) {
-        log('Error listando devices: ' + e.message, 'error');
+        log('Error descargando firmware: ' + e.message, 'error');
+        firmwareData = null;
+        updateFlashButton();
+    }
+}
+
+// ─── Modo avanzado: archivo custom ──────────────────────────────────
+function handleCustomFile(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    if (!file.name.toLowerCase().endsWith('.bin')) {
+        log('Error: solo archivos .bin', 'error');
+        return;
     }
 
-    // Pedir un dispositivo nuevo y volcar todo su descriptor
-    try {
-        log('Pulsa Conectar y elige el ESP32 en el picker...', 'info');
-        const device = await navigator.usb.requestDevice({ filters: USB_FILTERS });
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        firmwareData = e.target.result;
+        firmwareName = file.name + ' (custom)';
+        firmwareOffset = parseInt($('customOffsetSelect').value, 10);
+        firmwareIsRecovery = false;
 
-        log('━━━ Dispositivo seleccionado ━━━', 'success');
-        log(`Manufacturer:  ${device.manufacturerName || '—'}`, 'debug');
-        log(`Product:       ${device.productName || '—'}`, 'debug');
-        log(`Serial:        ${device.serialNumber || '—'}`, 'debug');
-        log(`VID:PID:       0x${device.vendorId.toString(16)}:0x${device.productId.toString(16)}`, 'debug');
-        log(`USB version:   ${device.usbVersionMajor}.${device.usbVersionMinor}`, 'debug');
-        log(`Device class:  0x${device.deviceClass.toString(16)} subclass=0x${device.deviceSubclass.toString(16)} protocol=0x${device.deviceProtocol.toString(16)}`, 'debug');
+        $('fileInfo').style.display = 'flex';
+        $('fileName').textContent = file.name;
+        $('fileSize').textContent = formatSize(firmwareData.length);
+        $('customOffsetRow').style.display = 'block';
 
-        log(`Configuraciones disponibles: ${device.configurations.length}`, 'info');
-        device.configurations.forEach((cfg, ci) => {
-            log(`  Config[${ci}] value=${cfg.configurationValue}`, 'debug');
-            cfg.interfaces.forEach((iface, ii) => {
-                iface.alternates.forEach((alt, ai) => {
-                    const cls = alt.interfaceClass;
-                    const className =
-                        cls === 0x02 ? 'CDC Communications' :
-                        cls === 0x0a ? 'CDC Data' :
-                        cls === 0xff ? 'Vendor-specific (JTAG?)' :
-                        cls === 0x03 ? 'HID' :
-                        `0x${cls.toString(16)}`;
-                    log(`    Interface ${iface.interfaceNumber} alt=${ai}: class=${className} subclass=0x${alt.interfaceSubclass.toString(16)} protocol=0x${alt.interfaceProtocol.toString(16)} endpoints=${alt.endpoints.length}`, 'debug');
-                });
-            });
-        });
+        // Resetear el select del catálogo (ya no se usa)
+        $('firmwareSelect').value = '';
+        $('firmwareDescription').textContent =
+            'Modo avanzado activo: usando archivo custom seleccionado.';
+        $('firmwareMeta').innerHTML = '';
 
-        // Intentar abrir el dispositivo y reportar resultado
-        log('Intentando abrir el dispositivo...', 'info');
-        try {
-            await device.open();
-            log('✓ device.open() OK', 'success');
+        log(`✓ Archivo custom: ${file.name} (${formatSize(firmwareData.length)})`, 'success');
+        log(`  Offset seleccionado: ${formatHex(firmwareOffset)}`, 'warning');
+        updateFlashButton();
+    };
+    reader.readAsBinaryString(file);
+}
 
-            try {
-                if (device.configuration === null) {
-                    log('Configuración no seleccionada, llamando selectConfiguration(1)...', 'info');
-                    await device.selectConfiguration(1);
-                }
-
-                // Probar claim de cada interface por separado
-                for (const iface of device.configuration.interfaces) {
-                    const ifNum = iface.interfaceNumber;
-                    try {
-                        await device.claimInterface(ifNum);
-                        log(`✓ claimInterface(${ifNum}) OK`, 'success');
-                        try { await device.releaseInterface(ifNum); } catch(_) {}
-                    } catch (e) {
-                        log(`✗ claimInterface(${ifNum}) FAIL: ${e.message}`, 'error');
-                    }
-                }
-            } finally {
-                try { await device.close(); } catch(_) {}
-            }
-        } catch (e) {
-            log(`✗ device.open() FAIL: ${e.message}`, 'error');
-        }
-
-        log('━━━━━━ FIN DIAGNÓSTICO ━━━━━━', 'warning');
-        log('Comparte este log con el equipo para análisis.', 'info');
-
-    } catch (e) {
-        if (e.name === 'NotFoundError') {
-            log('Cancelado por el usuario', 'warning');
-        } else {
-            log(`Error en diagnóstico: ${e.message}`, 'error');
-        }
+function onCustomOffsetChanged() {
+    if (firmwareData && firmwareName && firmwareName.includes('(custom)')) {
+        firmwareOffset = parseInt($('customOffsetSelect').value, 10);
+        log(`Offset custom actualizado: ${formatHex(firmwareOffset)}`, 'info');
     }
 }
 
@@ -202,7 +265,7 @@ async function connect() {
         log('Creando puerto serial (polyfill WebUSB → Web Serial)...');
         port = new WebSerialPolyfill(device);
 
-        log(`Abriendo puerto a ${BAUD_RATE} baud...`);
+        log(`Abriendo puerto a ${BAUD_RATE} baud (FIJO)...`);
         await port.open({ baudRate: BAUD_RATE });
         log('✓ Puerto abierto', 'success');
 
@@ -213,6 +276,7 @@ async function connect() {
         esploader = new ESPLoader({
             transport,
             baudrate: BAUD_RATE,
+            romBaudrate: BAUD_RATE,  // Forzar mismo baud — evitar el switch que falla
             terminal: espLoaderTerminal,
             debugLogging: false,
         });
@@ -238,65 +302,39 @@ async function connect() {
         const msg = error.message || '';
         if (msg.includes('No device selected') || error.name === 'NotFoundError') {
             log('Cancelado por el usuario', 'warning');
-        } else if (msg.includes('Unable to claim') || msg.includes('claiming') || msg.includes('Access denied')) {
-            log('━━━ HIPÓTESIS CONFIRMADA ━━━', 'warning');
-            log('El driver del kernel ya tiene reclamada la interface.', 'warning');
-            log('En Android sin root no se puede liberar.', 'warning');
-            log('Próximo paso: usar transport WebUSB custom sobre interface 1 (vendor-specific).', 'warning');
-            log('Pulsa "Diagnóstico USB" para ver qué interfaces están disponibles.', 'info');
+        } else if (msg.includes('Unable to claim') || msg.includes('Access denied')) {
+            log('━━━ DRIVER NO LIBERADO ━━━', 'warning');
+            log('Vuelve al APK Kolonus Flash Launcher y pulsa FLASH', 'warning');
+            log('para que libere el driver cdc_acm antes de conectar.', 'warning');
         }
     }
 }
 
-// ─── Selección de archivo ───────────────────────────────────────────
-function handleFile(event) {
-    const file = event.target.files[0];
-    if (!file) return;
-
-    if (!file.name.toLowerCase().endsWith('.bin')) {
-        log('Error: solo archivos .bin', 'error');
-        return;
-    }
-
-    const reader = new FileReader();
-    reader.onload = (e) => {
-        firmwareData = e.target.result;
-        firmwareName = file.name;
-
-        $('fileInfo').style.display = 'flex';
-        $('fileName').textContent = file.name;
-        $('fileSize').textContent =
-            (firmwareData.length / 1024).toFixed(1) + ' KB (' + firmwareData.length + ' bytes)';
-
-        log(`✓ Firmware: ${file.name} (${firmwareData.length} bytes)`, 'success');
-        updateFlashButton();
-    };
-    reader.readAsBinaryString(file);
-}
-
 // ─── Flash ──────────────────────────────────────────────────────────
 async function flash() {
-    if (!isConnected || !firmwareData) {
-        log('Conecta y selecciona archivo primero', 'error');
+    if (!isConnected || !firmwareData || firmwareOffset === null) {
+        log('Falta conectar y/o seleccionar firmware', 'error');
         return;
     }
 
-    const offset = getSelectedOffset();
-    const offsetHex = formatHex(offset);
+    const offsetHex = formatHex(firmwareOffset);
 
     try {
         $('btnFlash').disabled = true;
         log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━', 'info');
         log('INICIANDO PROGRAMACIÓN', 'warning');
-        log('Archivo: ' + firmwareName, 'info');
-        log('Tamaño:  ' + firmwareData.length + ' bytes', 'info');
-        log('Offset:  ' + offsetHex, 'warning');
+        log('Firmware: ' + firmwareName, 'info');
+        log('Tamaño:   ' + formatSize(firmwareData.length), 'info');
+        log('Offset:   ' + offsetHex, 'warning');
+        if (firmwareIsRecovery) {
+            log('Modo:     🚨 RECUPERACIÓN', 'warning');
+        }
         log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━', 'info');
 
         setProgress(0);
 
         await esploader.writeFlash({
-            fileArray: [{ data: firmwareData, address: offset }],
+            fileArray: [{ data: firmwareData, address: firmwareOffset }],
             flashSize: 'keep',
             flashMode: 'keep',
             flashFreq: 'keep',
@@ -323,33 +361,104 @@ async function flash() {
             } else if (typeof esploader.hardReset === 'function') {
                 await esploader.hardReset();
                 log('Reset vía esploader.hardReset()', 'success');
-            } else {
-                log('Reset automático no disponible — desconecta y reconecta el ESP32', 'warning');
             }
         } catch (e) {
             log('Reset falló: ' + e.message, 'warning');
         }
 
+        log('━━━ Vuelve al APK y pulsa "Restaurar lector QR" ━━━', 'info');
+
     } catch (error) {
-        log('ERROR: ' + error.message, 'error');
+        log('ERROR durante flasheo: ' + error.message, 'error');
         console.error('Flash error:', error);
     } finally {
         $('btnFlash').disabled = false;
     }
 }
 
-// ─── Persistencia del offset ────────────────────────────────────────
-function loadOffsetPreference() {
-    const saved = localStorage.getItem(STORAGE_KEY_OFFSET);
-    if (saved) {
-        const select = $('offsetSelect');
-        const option = [...select.options].find(o => o.value === saved);
-        if (option) select.value = saved;
-    }
-}
+// ─── Diagnóstico USB ────────────────────────────────────────────────
+async function runDiagnostic() {
+    log('━━━━━━ DIAGNÓSTICO USB ━━━━━━', 'warning');
 
-function saveOffsetPreference() {
-    localStorage.setItem(STORAGE_KEY_OFFSET, $('offsetSelect').value);
+    if (!navigator.usb) {
+        log('navigator.usb no existe — WebUSB no soportado', 'error');
+        return;
+    }
+    log('✓ navigator.usb disponible', 'success');
+
+    try {
+        const devices = await navigator.usb.getDevices();
+        log(`Dispositivos previamente autorizados: ${devices.length}`, 'info');
+        devices.forEach((d, i) => {
+            log(`  [${i}] VID=0x${d.vendorId.toString(16)} PID=0x${d.productId.toString(16)} ${d.productName || ''}`, 'debug');
+        });
+    } catch (e) {
+        log('Error listando devices: ' + e.message, 'error');
+    }
+
+    try {
+        log('Pulsa Conectar y elige el ESP32 en el picker...', 'info');
+        const device = await navigator.usb.requestDevice({ filters: USB_FILTERS });
+
+        log('━━━ Dispositivo seleccionado ━━━', 'success');
+        log(`Manufacturer:  ${device.manufacturerName || '—'}`, 'debug');
+        log(`Product:       ${device.productName || '—'}`, 'debug');
+        log(`Serial:        ${device.serialNumber || '—'}`, 'debug');
+        log(`VID:PID:       0x${device.vendorId.toString(16)}:0x${device.productId.toString(16)}`, 'debug');
+        log(`USB version:   ${device.usbVersionMajor}.${device.usbVersionMinor}`, 'debug');
+
+        log(`Configuraciones disponibles: ${device.configurations.length}`, 'info');
+        device.configurations.forEach((cfg, ci) => {
+            log(`  Config[${ci}] value=${cfg.configurationValue}`, 'debug');
+            cfg.interfaces.forEach((iface) => {
+                iface.alternates.forEach((alt, ai) => {
+                    const cls = alt.interfaceClass;
+                    const className =
+                        cls === 0x02 ? 'CDC Communications' :
+                        cls === 0x0a ? 'CDC Data' :
+                        cls === 0xff ? 'Vendor-specific (JTAG?)' :
+                        cls === 0x03 ? 'HID' :
+                        `0x${cls.toString(16)}`;
+                    log(`    Interface ${iface.interfaceNumber} alt=${ai}: class=${className} subclass=0x${alt.interfaceSubclass.toString(16)} endpoints=${alt.endpoints.length}`, 'debug');
+                });
+            });
+        });
+
+        log('Intentando abrir el dispositivo...', 'info');
+        try {
+            await device.open();
+            log('✓ device.open() OK', 'success');
+
+            try {
+                if (device.configuration === null) {
+                    await device.selectConfiguration(1);
+                }
+                for (const iface of device.configuration.interfaces) {
+                    const ifNum = iface.interfaceNumber;
+                    try {
+                        await device.claimInterface(ifNum);
+                        log(`✓ claimInterface(${ifNum}) OK`, 'success');
+                        try { await device.releaseInterface(ifNum); } catch(_) {}
+                    } catch (e) {
+                        log(`✗ claimInterface(${ifNum}) FAIL: ${e.message}`, 'error');
+                    }
+                }
+            } finally {
+                try { await device.close(); } catch(_) {}
+            }
+        } catch (e) {
+            log(`✗ device.open() FAIL: ${e.message}`, 'error');
+        }
+
+        log('━━━━━━ FIN DIAGNÓSTICO ━━━━━━', 'warning');
+
+    } catch (e) {
+        if (e.name === 'NotFoundError') {
+            log('Cancelado por el usuario', 'warning');
+        } else {
+            log(`Error en diagnóstico: ${e.message}`, 'error');
+        }
+    }
 }
 
 // ─── Log helpers ────────────────────────────────────────────────────
@@ -381,27 +490,30 @@ function clearLog() {
 
 // ─── Init ───────────────────────────────────────────────────────────
 function init() {
-    log('Kolonus ESP32-C3 Flasher (Web) v1.0.0', 'info');
-    log('────────────────────────────────────', 'info');
+    log('Kolonus ESP32-C3 Flasher v2.0.0', 'info');
+    log('────────────────────────────────', 'info');
 
     if (!checkCompatibility()) return;
     log('✓ WebUSB disponible', 'success');
     log('✓ HTTPS context OK', 'success');
+    log(`Baudrate fijo: ${BAUD_RATE}`, 'debug');
     log('', 'info');
 
-    loadOffsetPreference();
-
+    // Listeners
     $('btnConnect').addEventListener('click', connect);
     $('btnFile').addEventListener('click', () => $('fileInput').click());
-    $('fileInput').addEventListener('change', handleFile);
+    $('fileInput').addEventListener('change', handleCustomFile);
+    $('customOffsetSelect').addEventListener('change', onCustomOffsetChanged);
     $('btnFlash').addEventListener('click', flash);
     $('btnCopyLog').addEventListener('click', copyLog);
     $('btnClearLog').addEventListener('click', clearLog);
     $('btnDiagnostic').addEventListener('click', runDiagnostic);
-    $('offsetSelect').addEventListener('change', saveOffsetPreference);
+    $('firmwareSelect').addEventListener('change', onFirmwareSelectionChanged);
 
-    log('Pulsa "Conectar ESP32" para iniciar.', 'info');
-    log('Si falla, pulsa "Diagnóstico USB" para volcar info de las interfaces.', 'info');
+    loadFirmwareCatalog();
+
+    log('Selecciona un firmware del catálogo o usa Modo avanzado.', 'info');
+    log('Si el ESP32 está en boot loop, usa "🚨 RESCATAR ESP32 BRICKEADO".', 'warning');
 }
 
 init();

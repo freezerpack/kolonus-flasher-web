@@ -4,18 +4,19 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="theme-color" content="#16213e">
-    <title>Kolonus ESP32-C3 Flasher (Web)</title>
+    <title>Kolonus ESP32-C3 Flasher</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>🔥 Kolonus ESP32-C3 Flasher</h1>
-            <p>v1.0.0 — Web Edition (sin instalación)</p>
+            <p>v2.0.0 — Web Edition</p>
         </div>
 
         <div id="compatBanner" class="warning-box" style="display:none;"></div>
 
+        <!-- Estado de conexión -->
         <div class="card">
             <div class="status-row">
                 <div id="status" class="status">○ Desconectado</div>
@@ -23,51 +24,74 @@
             </div>
         </div>
 
+        <!-- Selección de firmware (poka-yoke) -->
         <div class="card">
             <label class="label-row">
-                <span>Dirección de Flash:</span>
-                <select id="offsetSelect">
-                    <option value="0x10000">0x10000 (App firmware)</option>
-                    <option value="0x00000">0x00000 (Merge / firmware completo)</option>
+                <span>📦 Firmware:</span>
+                <select id="firmwareSelect">
+                    <option value="">Cargando lista...</option>
                 </select>
             </label>
-            <p class="hint">
-                <strong>0x10000</strong> = solo App firmware &nbsp;|&nbsp;
-                <strong>0x00000</strong> = imagen merge completa (bootloader + partition + app)
-            </p>
+            <div id="firmwareDescription" class="hint" style="margin-top: 10px; min-height: 32px;"></div>
+            <div id="firmwareMeta" class="firmware-meta"></div>
         </div>
 
-        <div class="btn-row">
-            <button id="btnConnect" class="btn btn-connect">🔌 Conectar ESP32</button>
-            <button id="btnFile" class="btn btn-file">📁 Seleccionar .bin</button>
-        </div>
+        <!-- Modo avanzado: archivo custom -->
+        <details class="advanced">
+            <summary>⚙️ Modo avanzado</summary>
+            <div class="card" style="margin-top: 8px;">
+                <p class="hint" style="margin-bottom: 10px;">
+                    Si tienes un .bin propio que no está en la lista, selecciónalo aquí. Debes saber el offset correcto.
+                </p>
+                <button id="btnFile" class="btn btn-file" style="width: 100%;">📁 Seleccionar archivo .bin custom</button>
+                <input type="file" id="fileInput" accept=".bin" style="display:none;">
 
-        <input type="file" id="fileInput" accept=".bin" style="display:none;">
+                <div id="customOffsetRow" style="display:none; margin-top: 10px;">
+                    <label class="label-row">
+                        <span>Offset:</span>
+                        <select id="customOffsetSelect">
+                            <option value="65536">0x10000 (App firmware)</option>
+                            <option value="0">0x00000 (Merge completo)</option>
+                            <option value="32768">0x08000 (Partition table)</option>
+                        </select>
+                    </label>
+                </div>
 
-        <div id="fileInfo" class="file-info" style="display:none;">
-            <div>
-                <div id="fileName" class="name">—</div>
-                <div id="fileSize" class="size">0 bytes</div>
+                <div id="fileInfo" class="file-info" style="display:none; margin-top: 10px;">
+                    <div>
+                        <div id="fileName" class="name">—</div>
+                        <div id="fileSize" class="size">0 bytes</div>
+                    </div>
+                    <span class="check">✓</span>
+                </div>
             </div>
-            <span class="check">✓</span>
-        </div>
+        </details>
 
+        <!-- Botón Conectar -->
+        <button id="btnConnect" class="btn btn-connect" style="width: 100%; margin-top: 12px;">
+            🔌 Conectar ESP32
+        </button>
+
+        <!-- Progreso -->
         <div id="progressContainer" class="progress-container" style="display:none;">
             <div id="progressBar" class="progress-bar">0%</div>
         </div>
 
+        <!-- Botón Flash -->
         <button id="btnFlash" class="btn btn-flash" disabled>⚡ PROGRAMAR ESP32-C3</button>
 
+        <!-- Botones secundarios -->
         <div class="btn-row-small">
             <button id="btnCopyLog" class="btn btn-secondary">📋 Copiar Log</button>
             <button id="btnClearLog" class="btn btn-secondary">🗑️ Limpiar</button>
             <button id="btnDiagnostic" class="btn btn-secondary">🔍 Diagnóstico USB</button>
         </div>
 
+        <!-- Consola de logs -->
         <div id="console" class="console"></div>
 
         <div class="footer">
-            <p>Kolonus Flasher Web &middot; Velocidad: 115200 baud</p>
+            <p>Kolonus Flasher Web &middot; Velocidad fija: 115200 baud</p>
             <p>
                 <a href="https://github.com/freezerpack/kolonus-flasher-web" target="_blank" rel="noopener">
                     Código fuente en GitHub
