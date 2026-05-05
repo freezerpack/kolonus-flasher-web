@@ -130,16 +130,34 @@ function populateFirmwareDropdown() {
     select.innerHTML = '<option value="">— Selecciona un firmware —</option>';
 
     let defaultId = null;
+    let recoveryId = null;
     for (const fw of firmwareCatalog) {
         const opt = document.createElement('option');
         opt.value = fw.id;
         opt.textContent = fw.name;
         select.appendChild(opt);
         if (fw.default && !defaultId) defaultId = fw.id;
+        if (fw.type === 'recovery' && !recoveryId) recoveryId = fw.id;
     }
 
-    if (defaultId) {
-        select.value = defaultId;
+    // Si la URL trae ?mode=recovery, pre-seleccionar el firmware de recuperación.
+    // Este flag lo pasa el APK launcher cuando se pulsó el botón "🚨 RESCATE":
+    // primero pone el ESP32 en download mode (chip estable) y después abre
+    // Chrome aquí, ya con el firmware de recovery seleccionado.
+    const params = new URLSearchParams(location.search);
+    const mode = params.get('mode');
+    let initialId = defaultId;
+    if (mode === 'recovery' && recoveryId) {
+        initialId = recoveryId;
+        log('━━━ MODO RESCATE DESDE LANZADOR ━━━', 'warning');
+        log('El APK ya envió el ESP32 a download mode.', 'info');
+        log('Firmware de recuperación seleccionado automáticamente.', 'info');
+        log('Pulsa "Conectar ESP32" y procede a flashear.', 'success');
+        log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', 'warning');
+    }
+
+    if (initialId) {
+        select.value = initialId;
         onFirmwareSelectionChanged();
     }
 }
