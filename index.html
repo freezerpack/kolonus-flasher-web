@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#16213e">
+    <title>Kolonus ESP32-C3 Flasher (Web)</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔥 Kolonus ESP32-C3 Flasher</h1>
+            <p>v1.0.0 — Web Edition (sin instalación)</p>
+        </div>
+
+        <div id="compatBanner" class="warning-box" style="display:none;"></div>
+
+        <div class="card">
+            <div class="status-row">
+                <div id="status" class="status">○ Desconectado</div>
+                <div id="chipInfo" class="chip-info"></div>
+            </div>
+        </div>
+
+        <div class="card">
+            <label class="label-row">
+                <span>Dirección de Flash:</span>
+                <select id="offsetSelect">
+                    <option value="0x10000">0x10000 (App firmware)</option>
+                    <option value="0x00000">0x00000 (Merge / firmware completo)</option>
+                </select>
+            </label>
+            <p class="hint">
+                <strong>0x10000</strong> = solo App firmware &nbsp;|&nbsp;
+                <strong>0x00000</strong> = imagen merge completa (bootloader + partition + app)
+            </p>
+        </div>
+
+        <div class="btn-row">
+            <button id="btnConnect" class="btn btn-connect">🔌 Conectar ESP32</button>
+            <button id="btnFile" class="btn btn-file">📁 Seleccionar .bin</button>
+        </div>
+
+        <input type="file" id="fileInput" accept=".bin" style="display:none;">
+
+        <div id="fileInfo" class="file-info" style="display:none;">
+            <div>
+                <div id="fileName" class="name">—</div>
+                <div id="fileSize" class="size">0 bytes</div>
+            </div>
+            <span class="check">✓</span>
+        </div>
+
+        <div id="progressContainer" class="progress-container" style="display:none;">
+            <div id="progressBar" class="progress-bar">0%</div>
+        </div>
+
+        <button id="btnFlash" class="btn btn-flash" disabled>⚡ PROGRAMAR ESP32-C3</button>
+
+        <div class="btn-row-small">
+            <button id="btnCopyLog" class="btn btn-secondary">📋 Copiar Log</button>
+            <button id="btnClearLog" class="btn btn-secondary">🗑️ Limpiar</button>
+            <button id="btnDiagnostic" class="btn btn-secondary">🔍 Diagnóstico USB</button>
+        </div>
+
+        <div id="console" class="console"></div>
+
+        <div class="footer">
+            <p>Kolonus Flasher Web &middot; Velocidad: 115200 baud</p>
+            <p>
+                <a href="https://github.com/freezerpack/kolonus-flasher-web" target="_blank" rel="noopener">
+                    Código fuente en GitHub
+                </a>
+            </p>
+        </div>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>

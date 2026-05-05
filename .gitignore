@@ -1,0 +1,15 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+
+# Firmware binarios — no comitear .bin grandes a menos que se quiera distribuir
+# (Si se quiere firmware embebido, mover a /firmware/ y comentar esta línea)
+firmware/*.bin
