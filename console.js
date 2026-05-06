@@ -1,8 +1,8 @@
-// Kolonus ESP32-C3 Console (Web Edition v1.0.0)
+// Kolonus ESP32-C3 Console (Web Edition v1.1.0)
 // https://github.com/freezerpack/kolonus-flasher-web
 //
 // Consola serial para hablar con el firmware del ESP32-C3 corriendo
-// (NO download mode). Usa Web Serial API + xterm.js.
+// (NO download mode). Usa Web Serial API nativa o polyfill encima de WebUSB.
 //
 // Comandos del firmware v1.3.8: VERSION?, ID?, MAC?, STATS?, RESTARTS?,
 // WIFI?, WIFI,ssid,password, WIFI_CLEAR, PING_STATUS?, PING_ENABLE,
@@ -10,18 +10,38 @@
 //
 // Pre-requisito: el APK launcher debe haber liberado el cdc_acm vía
 // "📡 Consola" antes de abrir esta página. Si no, el chip aparece en el
-// picker de Web Serial pero al hacer port.open() falla con "device busy".
+// picker pero al hacer port.open() falla con "device busy".
+//
+// Compatibilidad de transporte:
+//   - Web Serial nativa: Chrome desktop ≥ 89, Chrome Android ≥ 122
+//   - Polyfill (WebUSB): Chrome Android ≥ 61 — caso del Konector V2
+//     con Chrome 119. Igual que app.js (flasher).
+
+import { SerialPort as WebSerialPolyfill }
+    from 'https://unpkg.com/web-serial-polyfill@1.0.15/dist/serial.js';
 
 // ─── Config ─────────────────────────────────────────────────────────
 const BAUD_RATE = 115200;  // Fijo, igual que el firmware
 
-// VID conocidos para ESP32-C3 (mismo array que el flasher)
-const USB_FILTERS = [
+// Filtros para Web Serial NATIVA (formato { usbVendorId })
+const NATIVE_FILTERS = [
     { usbVendorId: 0x303a },  // Espressif (ESP32-C3 USB-JTAG nativo)
     { usbVendorId: 0x10c4 },  // CP210x (Silicon Labs)
     { usbVendorId: 0x1a86 },  // CH340 (WCH)
     { usbVendorId: 0x0403 },  // FTDI
 ];
+
+// Filtros para WebUSB (formato { vendorId }, mismo set)
+const WEBUSB_FILTERS = [
+    { vendorId: 0x303a },
+    { vendorId: 0x10c4 },
+    { vendorId: 0x1a86 },
+    { vendorId: 0x0403 },
+];
+
+// Detección de transporte disponible
+const hasNativeSerial = ('serial' in navigator);
+const hasWebUSB = ('usb' in navigator);
 
 // ─── Estado ─────────────────────────────────────────────────────────
 let port = null;
@@ -40,10 +60,10 @@ const $ = (id) => document.getElementById(id);
 // ─── Compatibilidad ─────────────────────────────────────────────────
 function checkCompatibility() {
     const banner = $('compatBanner');
-    if (!('serial' in navigator)) {
+    if (!hasNativeSerial && !hasWebUSB) {
         banner.style.display = 'block';
-        banner.textContent = '❌ Tu navegador NO soporta Web Serial API. ' +
-            'Usa Chrome, Edge u Opera (Chromium 89+) en escritorio o Android.';
+        banner.textContent = '❌ Tu navegador NO soporta Web Serial NI WebUSB. ' +
+            'Usa Chrome, Edge u Opera (Chromium 61+).';
         $('btnConnect').disabled = true;
         return false;
     }
@@ -126,29 +146,43 @@ function setConnectedUI(connected) {
     }
 }
 
-// ─── Conexión Web Serial ────────────────────────────────────────────
+// ─── Conexión: Web Serial nativo o polyfill encima de WebUSB ───────
 async function connectSerial() {
     if (!checkCompatibility()) return;
 
     try {
-        // Pedir al usuario que seleccione el puerto
-        port = await navigator.serial.requestPort({ filters: USB_FILTERS });
+        let vidNum = null;
+        let pidNum = null;
 
-        await port.open({
-            baudRate: BAUD_RATE,
-            dataBits: 8,
-            stopBits: 1,
-            parity: 'none',
-            flowControl: 'none',
-        });
+        if (hasNativeSerial) {
+            // Camino "moderno" — Chrome desktop ≥89 y Chrome Android ≥122
+            termWriteSystem('Usando Web Serial nativa');
+            port = await navigator.serial.requestPort({ filters: NATIVE_FILTERS });
+            await port.open({
+                baudRate: BAUD_RATE,
+                dataBits: 8,
+                stopBits: 1,
+                parity: 'none',
+                flowControl: 'none',
+            });
+            const info = port.getInfo();
+            vidNum = info.usbVendorId;
+            pidNum = info.usbProductId;
+        } else {
+            // Camino "legacy" — Chrome Android <122 (caso Konector V2 / Android 7)
+            termWriteSystem('Usando polyfill Web Serial encima de WebUSB');
+            const device = await navigator.usb.requestDevice({ filters: WEBUSB_FILTERS });
+            vidNum = device.vendorId;
+            pidNum = device.productId;
+            port = new WebSerialPolyfill(device);
+            await port.open({ baudRate: BAUD_RATE });
+        }
 
-        // Info del puerto seleccionado
-        const info = port.getInfo();
-        const vidHex = info.usbVendorId
-            ? '0x' + info.usbVendorId.toString(16).padStart(4, '0')
+        const vidHex = vidNum
+            ? '0x' + vidNum.toString(16).padStart(4, '0')
             : '?';
-        const pidHex = info.usbProductId
-            ? '0x' + info.usbProductId.toString(16).padStart(4, '0')
+        const pidHex = pidNum
+            ? '0x' + pidNum.toString(16).padStart(4, '0')
             : '?';
         $('portInfo').textContent = `VID=${vidHex} PID=${pidHex} · ${BAUD_RATE} baud`;
 
@@ -397,11 +431,20 @@ window.addEventListener('DOMContentLoaded', () => {
         if (term) term.clear();
     });
 
-    // Si el puerto se desconecta (USB unplug)
-    if ('serial' in navigator) {
-        navigator.serial.addEventListener('disconnect', (e) => {
-            if (e.target === port) {
+    // Listeners de desconexión física — los registramos en ambos
+    // transportes para cubrir el caso nativo y el polyfill (WebUSB).
+    if (hasNativeSerial) {
+        navigator.serial.addEventListener('disconnect', () => {
+            if (isConnected) {
                 termWriteSystem('⚠ Puerto desconectado físicamente');
+                disconnectSerial();
+            }
+        });
+    }
+    if (hasWebUSB) {
+        navigator.usb.addEventListener('disconnect', () => {
+            if (isConnected) {
+                termWriteSystem('⚠ USB desconectado físicamente');
                 disconnectSerial();
             }
         });
