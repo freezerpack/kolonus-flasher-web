@@ -192,3 +192,146 @@ body {
 }
 .footer a { color: #4fc3f7; text-decoration: none; }
 .footer a:hover { text-decoration: underline; }
+
+/* ─── Console (console.html / console.js) ───────────────────────── */
+
+.console-container { max-width: 800px; }
+
+.quick-cmd-section { margin-bottom: 14px; }
+.quick-cmd-section:last-child { margin-bottom: 0; }
+.quick-cmd-label {
+    display: block;
+    color: #b0b0b0;
+    font-size: 12px;
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.quick-cmd-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.btn-cmd {
+    flex: 0 1 auto;
+    padding: 8px 12px;
+    font-size: 13px;
+    font-family: Menlo, Monaco, "Courier New", monospace;
+    background: #0a0a0a;
+    color: #4fc3f7;
+    border: 1px solid #333;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+.btn-cmd:hover {
+    background: #1a1a2e;
+    border-color: #4fc3f7;
+}
+.btn-cmd:active { transform: scale(0.97); }
+
+.btn-cmd-danger {
+    color: #ff9800;
+    border-color: #5a3a00;
+}
+.btn-cmd-danger:hover {
+    background: #2a1a00;
+    border-color: #ff9800;
+    color: #ffb84d;
+}
+
+.terminal-container {
+    background: #0a0a0a;
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 8px;
+    margin-bottom: 12px;
+    height: 360px;
+    overflow: hidden;
+}
+.terminal {
+    width: 100%;
+    height: 100%;
+}
+/* xterm.js viene con su propio CSS pero ajustamos algunos detalles */
+.xterm .xterm-viewport { background: transparent !important; }
+
+.input-row {
+    display: flex;
+    gap: 8px;
+}
+
+.cmd-input {
+    flex: 1;
+    background: #0a0a0a;
+    color: #e0e0e0;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-size: 14px;
+    font-family: Menlo, Monaco, "Courier New", monospace;
+    outline: none;
+}
+.cmd-input:focus { border-color: #4fc3f7; }
+
+.btn-send {
+    padding: 10px 16px;
+    background: #4fc3f7;
+    color: #000;
+    border: none;
+    border-radius: 6px;
+    font-weight: bold;
+    cursor: pointer;
+    font-family: Menlo, Monaco, "Courier New", monospace;
+}
+.btn-send:hover { background: #6fd5ff; }
+.btn-send:active { transform: scale(0.97); }
+
+.btn-secondary-danger {
+    color: #ff7043 !important;
+}
+.btn-secondary-danger:hover {
+    background: #2a1a00 !important;
+    border-color: #ff7043 !important;
+}
+
+/* Modal de WIFI ─────────────────────────────────────────────────── */
+.modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.75);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: 16px;
+}
+
+.modal-content {
+    background: #16213e;
+    border: 1px solid #4fc3f7;
+    border-radius: 12px;
+    padding: 20px;
+    max-width: 420px;
+    width: 100%;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+.modal-content h3 {
+    color: #4fc3f7;
+    margin-bottom: 14px;
+    font-size: 18px;
+}
+
+.modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 16px;
+}
+
+.modal-actions .btn {
+    flex: 0 1 auto;
+    min-width: 100px;
+}

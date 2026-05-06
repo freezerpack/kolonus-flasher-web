@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#16213e">
+    <title>Kolonus ESP32-C3 Console</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+</head>
+<body>
+    <div class="container console-container">
+        <div class="header">
+            <h1>📡 Kolonus ESP32-C3 Console</h1>
+            <p>v1.0.0 — Consola serial via Web Serial API</p>
+        </div>
+
+        <!-- Banner de aviso -->
+        <div class="warning-box">
+            ⚠ Mientras la consola esté abierta, el lector QR del Konector NO funcionará.
+            Cierra la consola al terminar.
+        </div>
+
+        <div id="compatBanner" class="warning-box error" style="display:none;"></div>
+
+        <!-- Estado de conexión -->
+        <div class="card">
+            <div class="status-row">
+                <div id="status" class="status">○ Desconectado</div>
+                <div id="portInfo" class="chip-info"></div>
+            </div>
+        </div>
+
+        <!-- Botón Conectar -->
+        <button id="btnConnect" class="btn btn-connect" style="width: 100%;">
+            🔌 Conectar al ESP32
+        </button>
+
+        <!-- Quick commands -->
+        <div id="quickCommands" class="card" style="display:none;">
+            <div class="quick-cmd-section">
+                <span class="quick-cmd-label">🔍 Información</span>
+                <div class="quick-cmd-row">
+                    <button class="btn btn-cmd" data-cmd="VERSION?">VERSION?</button>
+                    <button class="btn btn-cmd" data-cmd="ID?">ID?</button>
+                    <button class="btn btn-cmd" data-cmd="MAC?">MAC?</button>
+                    <button class="btn btn-cmd" data-cmd="STATS?">STATS?</button>
+                    <button class="btn btn-cmd" data-cmd="RESTARTS?">RESTARTS?</button>
+                    <button class="btn btn-cmd" data-cmd="HELP">HELP</button>
+                </div>
+            </div>
+
+            <div class="quick-cmd-section">
+                <span class="quick-cmd-label">📡 WiFi</span>
+                <div class="quick-cmd-row">
+                    <button class="btn btn-cmd" data-cmd="WIFI?">WIFI?</button>
+                    <button class="btn btn-cmd" id="btnWifiSet">WIFI configurar...</button>
+                    <button class="btn btn-cmd btn-cmd-danger" id="btnWifiClear">WIFI_CLEAR ⚠</button>
+                </div>
+            </div>
+
+            <div class="quick-cmd-section">
+                <span class="quick-cmd-label">🔄 PING/ACK</span>
+                <div class="quick-cmd-row">
+                    <button class="btn btn-cmd" data-cmd="PING_STATUS?">PING_STATUS?</button>
+                    <button class="btn btn-cmd" data-cmd="PING_ENABLE">PING_ENABLE</button>
+                    <button class="btn btn-cmd" data-cmd="PING_DISABLE">PING_DISABLE</button>
+                </div>
+            </div>
+
+            <div class="quick-cmd-section">
+                <span class="quick-cmd-label">🧪 Debug & acciones</span>
+                <div class="quick-cmd-row">
+                    <button class="btn btn-cmd" data-cmd="UART_TEST">UART_TEST</button>
+                    <button class="btn btn-cmd btn-cmd-danger" id="btnUsbReset">USB_RESET ⚠</button>
+                    <button class="btn btn-cmd btn-cmd-danger" id="btnRestartsClear">RESTARTS_CLEAR ⚠</button>
+                    <button class="btn btn-cmd btn-cmd-danger" id="btnReset">RESET ⚠</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Terminal xterm -->
+        <div id="terminalContainer" class="terminal-container" style="display:none;">
+            <div id="terminal" class="terminal"></div>
+        </div>
+
+        <!-- Input de comando libre -->
+        <div id="inputRow" class="card" style="display:none;">
+            <div class="input-row">
+                <input id="cmdInput" type="text" class="cmd-input"
+                       placeholder="Teclea cualquier comando y Enter..."
+                       autocomplete="off" spellcheck="false">
+                <button id="btnSendCmd" class="btn btn-send">Enter ⏎</button>
+            </div>
+            <div class="hint" style="margin-top: 6px;">
+                Tip: ↑/↓ navegan el historial. El comando se envía con CRLF (\r\n).
+            </div>
+        </div>
+
+        <!-- Botones secundarios (visibles cuando hay conexión) -->
+        <div id="secondaryButtons" class="btn-row-small" style="display:none;">
+            <button id="btnCopyLog" class="btn btn-secondary">📋 Copiar log</button>
+            <button id="btnClearLog" class="btn btn-secondary">🗑️ Limpiar</button>
+            <button id="btnDisconnect" class="btn btn-secondary btn-secondary-danger">🔌 Desconectar</button>
+        </div>
+
+        <!-- Modal de WIFI configurar -->
+        <div id="wifiModal" class="modal" style="display:none;">
+            <div class="modal-content">
+                <h3>Configurar WiFi</h3>
+                <label class="label-row" style="flex-direction:column; align-items:stretch; gap:6px;">
+                    <span>SSID:</span>
+                    <input id="wifiSsid" type="text" class="cmd-input" maxlength="32" autocomplete="off" spellcheck="false">
+                </label>
+                <label class="label-row" style="flex-direction:column; align-items:stretch; gap:6px; margin-top:10px;">
+                    <span>Password:</span>
+                    <input id="wifiPass" type="text" class="cmd-input" autocomplete="off" spellcheck="false">
+                </label>
+                <div class="hint" style="margin-top:6px;">
+                    Comando que se enviará: <code id="wifiCmdPreview" style="color:#4fc3f7;">WIFI,,</code>
+                </div>
+                <div class="modal-actions">
+                    <button id="wifiCancel" class="btn btn-secondary">Cancelar</button>
+                    <button id="wifiSend" class="btn btn-connect">Enviar</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p>Kolonus Console &middot; 115200 baud &middot; firmware v1.3.x+</p>
+            <p>
+                <a href="index.html">⚡ Volver al flasher</a>
+                &middot;
+                <a href="https://github.com/freezerpack/kolonus-flasher-web" target="_blank" rel="noopener">
+                    Código fuente
+                </a>
+            </p>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
+    <script type="module" src="console.js"></script>
+</body>
+</html>
