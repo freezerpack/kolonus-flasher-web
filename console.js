@@ -186,6 +186,10 @@ async function connectSerial() {
             : '?';
         $('portInfo').textContent = `VID=${vidHex} PID=${pidHex} · ${BAUD_RATE} baud`;
 
+        // Adquirir reader y writer UNA SOLA VEZ y mantenerlos durante
+        // toda la sesión. Ver doc en acquireStreams().
+        acquireStreams();
+
         updateStatus('Conectado al ESP32-C3', true);
         setConnectedUI(true);
 
@@ -194,7 +198,7 @@ async function connectSerial() {
         termWriteSystem('Tip: dale a VERSION? para empezar');
         termWriteSystem('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
-        // Lanzar read loop en background
+        // Lanzar read loop en background usando el reader ya adquirido
         startReadLoop();
 
     } catch (err) {
@@ -213,44 +217,64 @@ async function connectSerial() {
 }
 
 async function disconnectSerial() {
-    try {
-        if (readLoopAbort) {
-            readLoopAbort.abort();
-            readLoopAbort = null;
-        }
-        if (reader) {
-            try { await reader.cancel(); } catch (_) {}
-            try { reader.releaseLock(); } catch (_) {}
-            reader = null;
-        }
-        if (writer) {
-            try { writer.releaseLock(); } catch (_) {}
-            writer = null;
-        }
-        if (port) {
-            try { await port.close(); } catch (_) {}
-            port = null;
-        }
-    } catch (err) {
-        console.error('Error al desconectar:', err);
+    // 1. Marcar el loop para que salga
+    if (readLoopAbort) {
+        readLoopAbort.abort();
+        readLoopAbort = null;
+    }
+    // 2. Cancelar el reader (rompe cualquier read() pendiente)
+    if (reader) {
+        try { await reader.cancel(); } catch (_) {}
+        try { reader.releaseLock(); } catch (_) {}
+        reader = null;
+    }
+    // 3. Cerrar el writer (esperar a que se vacíe el buffer)
+    if (writer) {
+        try { await writer.close(); } catch (_) {}
+        try { writer.releaseLock(); } catch (_) {}
+        writer = null;
+    }
+    // 4. Cerrar el puerto
+    if (port) {
+        try { await port.close(); } catch (_) {}
+        port = null;
     }
     updateStatus('Desconectado', false);
     setConnectedUI(false);
     termWriteSystem('━━━ Desconectado ━━━');
 }
 
+/** Adquiere reader y writer al inicio de la sesión y los mantiene
+ *  abiertos hasta disconnectSerial. Esto es crucial con el polyfill
+ *  web-serial-polyfill: si hacemos getReader/releaseLock + getWriter/
+ *  releaseLock alternados, el polyfill se confunde y cierra readable
+ *  con done:true espontáneamente — eso es lo que hacía que el read
+ *  loop muriera con "Read loop terminó: undefined". */
+function acquireStreams() {
+    reader = port.readable.getReader();
+    writer = port.writable.getWriter();
+}
+
 /** Read loop: escucha bytes del puerto y los pinta línea por línea
- *  en el terminal. Acumula en `lineBuffer` hasta encontrar \n.        */
+ *  en el terminal. Acumula en `lineBuffer` hasta encontrar \n.
+ *  IMPORTANTE: NO hace getReader/releaseLock — usa el reader que
+ *  acquireStreams() ya tiene activo durante toda la sesión.            */
 async function startReadLoop() {
     readLoopAbort = new AbortController();
     const decoder = new TextDecoder();
     let lineBuffer = '';
 
     try {
-        reader = port.readable.getReader();
         while (!readLoopAbort.signal.aborted) {
-            const { value, done } = await reader.read();
-            if (done) break;
+            const result = await reader.read();
+            const { value, done } = result;
+
+            if (done) {
+                // El stream se cerró (puerto desconectado o cerrado).
+                // En polyfill esto puede pasar por bug — registrarlo claro.
+                termWriteSystem('⚠ Stream cerrado por el navegador (done:true)');
+                break;
+            }
             if (!value) continue;
 
             const text = decoder.decode(value, { stream: true });
@@ -265,19 +289,23 @@ async function startReadLoop() {
             }
         }
     } catch (err) {
-        if (err.name !== 'AbortError') {
-            console.error('Read loop error:', err);
-            termWriteSystem('⚠ Read loop terminó: ' + err.message);
-        }
-    } finally {
-        try { reader && reader.releaseLock(); } catch (_) {}
-        reader = null;
+        if (err.name === 'AbortError') return;
+        // Loguear con detalle — antes salía "undefined" porque algunos
+        // errores del polyfill no son Error con .message
+        const msg = (err && err.message)
+            || (err && err.toString && err.toString())
+            || JSON.stringify(err)
+            || '(sin mensaje)';
+        console.error('Read loop error:', err);
+        termWriteSystem('⚠ Read loop terminó: ' + msg);
     }
 }
 
-/** Envía un comando al ESP32 (agrega CRLF y registra en historial). */
+/** Envía un comando al ESP32 (agrega CRLF y registra en historial).
+ *  USA el writer ya adquirido por acquireStreams() — sin releaseLock,
+ *  sin re-getWriter cada vez. */
 async function sendCommand(cmd) {
-    if (!isConnected || !port) {
+    if (!isConnected || !writer) {
         termWriteSystem('⚠ No conectado');
         return;
     }
@@ -285,11 +313,8 @@ async function sendCommand(cmd) {
     if (!trimmed) return;
 
     try {
-        writer = port.writable.getWriter();
         const encoder = new TextEncoder();
         await writer.write(encoder.encode(trimmed + '\r\n'));
-        writer.releaseLock();
-        writer = null;
 
         termWriteSent(trimmed);
 
@@ -300,10 +325,9 @@ async function sendCommand(cmd) {
         }
         historyIndex = cmdHistory.length;
     } catch (err) {
+        const msg = (err && err.message) || String(err);
         console.error('Error sending:', err);
-        termWriteSystem('⚠ Error al enviar: ' + err.message);
-        try { writer && writer.releaseLock(); } catch (_) {}
-        writer = null;
+        termWriteSystem('⚠ Error al enviar: ' + msg);
     }
 }
 
