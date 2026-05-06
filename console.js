@@ -1,27 +1,28 @@
-// Kolonus ESP32-C3 Console (Web Edition v1.1.0)
+// Kolonus ESP32-C3 Console (Web Edition v1.2.0)
 // https://github.com/freezerpack/kolonus-flasher-web
 //
 // Consola serial para hablar con el firmware del ESP32-C3 corriendo
-// (NO download mode). Usa Web Serial API nativa o polyfill encima de WebUSB.
+// (NO download mode). Dos modos de transporte autodetectados:
+//
+//   - NATIVO (Web Serial API): Chrome desktop ≥89, Chrome Android ≥122.
+//     port.readable.getReader() / port.writable.getWriter().
+//
+//   - WEBUSB DIRECTO: Chrome Android <122 (caso Konector V2 / Android 7).
+//     navigator.usb + claimInterface + transferIn/transferOut.
+//     NO usamos web-serial-polyfill porque tiene bug conocido:
+//     "TypeError: Failed to execute 'enqueue' on 'ReadableByteStreamController':
+//     chunk is empty" — el polyfill intenta inyectar paquetes vacíos al
+//     ReadableStream cuando el USB-Serial-JTAG del C3 envía keep-alives.
 //
 // Comandos del firmware v1.3.8: VERSION?, ID?, MAC?, STATS?, RESTARTS?,
 // WIFI?, WIFI,ssid,password, WIFI_CLEAR, PING_STATUS?, PING_ENABLE,
 // PING_DISABLE, USB_RESET, RESET, RESTARTS_CLEAR, UART_TEST, HELP.
 //
 // Pre-requisito: el APK launcher debe haber liberado el cdc_acm vía
-// "📡 Consola" antes de abrir esta página. Si no, el chip aparece en el
-// picker pero al hacer port.open() falla con "device busy".
-//
-// Compatibilidad de transporte:
-//   - Web Serial nativa: Chrome desktop ≥ 89, Chrome Android ≥ 122
-//   - Polyfill (WebUSB): Chrome Android ≥ 61 — caso del Konector V2
-//     con Chrome 119. Igual que app.js (flasher).
-
-import { SerialPort as WebSerialPolyfill }
-    from 'https://unpkg.com/web-serial-polyfill@1.0.15/dist/serial.js';
+// "📡 Consola" antes de abrir esta página.
 
 // ─── Config ─────────────────────────────────────────────────────────
-const BAUD_RATE = 115200;  // Fijo, igual que el firmware
+const BAUD_RATE = 115200;  // En USB-CDC nativo del C3 es cosmético
 
 // Filtros para Web Serial NATIVA (formato { usbVendorId })
 const NATIVE_FILTERS = [
@@ -31,7 +32,7 @@ const NATIVE_FILTERS = [
     { usbVendorId: 0x0403 },  // FTDI
 ];
 
-// Filtros para WebUSB (formato { vendorId }, mismo set)
+// Filtros para WebUSB (formato { vendorId })
 const WEBUSB_FILTERS = [
     { vendorId: 0x303a },
     { vendorId: 0x10c4 },
@@ -39,20 +40,35 @@ const WEBUSB_FILTERS = [
     { vendorId: 0x0403 },
 ];
 
+// Códigos de clase USB
+const CDC_DATA_CLASS = 0x0A;
+const CDC_COMM_CLASS = 0x02;
+const VENDOR_CLASS = 0xFF;
+
 // Detección de transporte disponible
 const hasNativeSerial = ('serial' in navigator);
 const hasWebUSB = ('usb' in navigator);
 
 // ─── Estado ─────────────────────────────────────────────────────────
-let port = null;
+let mode = null;  // 'native' o 'webusb'
+let isConnected = false;
+let term = null;
+let fitAddon = null;
+let cmdHistory = [];
+let historyIndex = -1;
+let readLoopAbort = null;
+
+// Estado modo nativo
+let port = null;        // SerialPort (Web Serial API)
 let reader = null;
 let writer = null;
-let readLoopAbort = null;       // AbortController para cortar el read loop
-let isConnected = false;
-let term = null;                 // xterm.js Terminal
-let fitAddon = null;             // FitAddon
-let cmdHistory = [];             // historial de comandos enviados
-let historyIndex = -1;           // posición actual en historial (↑/↓)
+
+// Estado modo WebUSB
+let usbDevice = null;     // USBDevice
+let usbInterface = null;  // número de interface CDC Data o vendor
+let usbCommInterface = null;  // número de interface CDC Communication (para SET_CONTROL_LINE_STATE)
+let usbEpIn = null;       // endpoint bulk IN
+let usbEpOut = null;      // endpoint bulk OUT
 
 // ─── DOM refs ───────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -83,44 +99,38 @@ function initTerminal() {
         fontSize: 13,
         lineHeight: 1.2,
         scrollback: 5000,
-        convertEol: true,        // \n → \r\n al imprimir
+        convertEol: true,
         cursorBlink: true,
-        disableStdin: true,      // todo input va por #cmdInput, no por el terminal
+        disableStdin: true,
     });
     fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
     term.open($('terminal'));
     fitAddon.fit();
-
-    // Re-fit cuando cambia el viewport
     window.addEventListener('resize', () => fitAddon.fit());
 
-    // Banner inicial
-    termWriteSystem('Kolonus Console v1.0 — Conecta al ESP32-C3 para empezar');
+    termWriteSystem('Kolonus Console v1.2 — Conecta al ESP32-C3 para empezar');
     termWriteSystem('Tecla ↑/↓ para navegar el historial · Enter para enviar');
 }
 
-/** Escribe una línea coloreada de "sistema" (gris). */
 function termWriteSystem(text) {
     if (!term) return;
     term.writeln('\x1b[90m' + text + '\x1b[0m');
 }
 
-/** Escribe el comando que ENVIAMOS al chip (cyan, prefijo `> `). */
 function termWriteSent(text) {
     if (!term) return;
     term.writeln('\x1b[36m> ' + text + '\x1b[0m');
 }
 
-/** Escribe lo que el chip RESPONDE (color según contenido). */
 function termWriteRecv(text) {
     if (!term) return;
     if (text.startsWith('OK,')) {
-        term.writeln('\x1b[32m' + text + '\x1b[0m');  // verde
+        term.writeln('\x1b[32m' + text + '\x1b[0m');
     } else if (text.startsWith('ERR,')) {
-        term.writeln('\x1b[31m' + text + '\x1b[0m');  // rojo
+        term.writeln('\x1b[31m' + text + '\x1b[0m');
     } else {
-        term.writeln(text);                            // default
+        term.writeln(text);
     }
 }
 
@@ -140,72 +150,141 @@ function setConnectedUI(connected) {
     $('secondaryButtons').style.display = connected ? 'flex' : 'none';
 
     if (connected) {
-        // Re-ajustar terminal ahora que es visible
         setTimeout(() => fitAddon && fitAddon.fit(), 50);
         $('cmdInput').focus();
     }
 }
 
-// ─── Conexión: Web Serial nativo o polyfill encima de WebUSB ───────
+function vidPidHex(vid, pid) {
+    const v = vid ? '0x' + vid.toString(16).padStart(4, '0') : '?';
+    const p = pid ? '0x' + pid.toString(16).padStart(4, '0') : '?';
+    return { vidHex: v, pidHex: p };
+}
+
+// ─── Conexión modo NATIVO (Web Serial API) ──────────────────────────
+async function connectNative() {
+    port = await navigator.serial.requestPort({ filters: NATIVE_FILTERS });
+    await port.open({
+        baudRate: BAUD_RATE,
+        dataBits: 8,
+        stopBits: 1,
+        parity: 'none',
+        flowControl: 'none',
+    });
+    reader = port.readable.getReader();
+    writer = port.writable.getWriter();
+
+    const info = port.getInfo();
+    return vidPidHex(info.usbVendorId, info.usbProductId);
+}
+
+// ─── Conexión modo WEBUSB DIRECTO ───────────────────────────────────
+async function connectWebUSB() {
+    usbDevice = await navigator.usb.requestDevice({ filters: WEBUSB_FILTERS });
+    await usbDevice.open();
+
+    if (usbDevice.configuration === null) {
+        await usbDevice.selectConfiguration(1);
+    }
+
+    // Buscar interface CDC Data (clase 0x0A) o cualquier interface
+    // con endpoints bulk in/out (caso vendor-specific).
+    const interfaces = usbDevice.configuration.interfaces;
+    let dataIface = null;
+    let commIface = null;
+
+    for (const iface of interfaces) {
+        const alt = iface.alternates[0];
+        if (alt.interfaceClass === CDC_DATA_CLASS) {
+            dataIface = iface;
+        } else if (alt.interfaceClass === CDC_COMM_CLASS) {
+            commIface = iface;
+        }
+    }
+
+    // Fallback: buscar interface con endpoints bulk in/out (vendor-specific)
+    if (!dataIface) {
+        for (const iface of interfaces) {
+            const alt = iface.alternates[0];
+            const hasBulkIn  = alt.endpoints.some(e => e.direction === 'in'  && e.type === 'bulk');
+            const hasBulkOut = alt.endpoints.some(e => e.direction === 'out' && e.type === 'bulk');
+            if (hasBulkIn && hasBulkOut) {
+                dataIface = iface;
+                break;
+            }
+        }
+    }
+
+    if (!dataIface) {
+        throw new Error('No se encontró interface CDC Data ni alternativa con endpoints bulk');
+    }
+
+    usbInterface = dataIface.interfaceNumber;
+    usbCommInterface = commIface ? commIface.interfaceNumber : 0;
+
+    await usbDevice.claimInterface(usbInterface);
+
+    const alt = dataIface.alternates[0];
+    const epIn  = alt.endpoints.find(e => e.direction === 'in'  && e.type === 'bulk');
+    const epOut = alt.endpoints.find(e => e.direction === 'out' && e.type === 'bulk');
+    if (!epIn || !epOut) {
+        throw new Error('Interface CDC Data sin endpoints bulk in/out');
+    }
+    usbEpIn = epIn.endpointNumber;
+    usbEpOut = epOut.endpointNumber;
+
+    // CDC SET_CONTROL_LINE_STATE: DTR=1 RTS=1 (puerto activo).
+    // El chip USB-Serial-JTAG del C3 puede ignorar esto, pero para
+    // CP210x/CH340/FTDI sí es necesario para que el chip responda.
+    try {
+        await usbDevice.controlTransferOut({
+            requestType: 'class',
+            recipient: 'interface',
+            request: 0x22,         // SET_CONTROL_LINE_STATE
+            value: 0x03,           // DTR=bit0=1, RTS=bit1=1
+            index: usbCommInterface,
+        });
+    } catch (e) {
+        // No fatal — algunos firmwares (incluso del C3) no soportan este request
+        console.warn('SET_CONTROL_LINE_STATE falló (no fatal):', e);
+    }
+
+    return vidPidHex(usbDevice.vendorId, usbDevice.productId);
+}
+
+// ─── Conexión global ────────────────────────────────────────────────
 async function connectSerial() {
     if (!checkCompatibility()) return;
 
     try {
-        let vidNum = null;
-        let pidNum = null;
-
+        let vidpid;
         if (hasNativeSerial) {
-            // Camino "moderno" — Chrome desktop ≥89 y Chrome Android ≥122
-            termWriteSystem('Usando Web Serial nativa');
-            port = await navigator.serial.requestPort({ filters: NATIVE_FILTERS });
-            await port.open({
-                baudRate: BAUD_RATE,
-                dataBits: 8,
-                stopBits: 1,
-                parity: 'none',
-                flowControl: 'none',
-            });
-            const info = port.getInfo();
-            vidNum = info.usbVendorId;
-            pidNum = info.usbProductId;
+            mode = 'native';
+            termWriteSystem('Modo: Web Serial nativo');
+            vidpid = await connectNative();
         } else {
-            // Camino "legacy" — Chrome Android <122 (caso Konector V2 / Android 7)
-            termWriteSystem('Usando polyfill Web Serial encima de WebUSB');
-            const device = await navigator.usb.requestDevice({ filters: WEBUSB_FILTERS });
-            vidNum = device.vendorId;
-            pidNum = device.productId;
-            port = new WebSerialPolyfill(device);
-            await port.open({ baudRate: BAUD_RATE });
+            mode = 'webusb';
+            termWriteSystem('Modo: WebUSB directo (sin polyfill)');
+            vidpid = await connectWebUSB();
         }
 
-        const vidHex = vidNum
-            ? '0x' + vidNum.toString(16).padStart(4, '0')
-            : '?';
-        const pidHex = pidNum
-            ? '0x' + pidNum.toString(16).padStart(4, '0')
-            : '?';
-        $('portInfo').textContent = `VID=${vidHex} PID=${pidHex} · ${BAUD_RATE} baud`;
-
-        // Adquirir reader y writer UNA SOLA VEZ y mantenerlos durante
-        // toda la sesión. Ver doc en acquireStreams().
-        acquireStreams();
+        $('portInfo').textContent = `VID=${vidpid.vidHex} PID=${vidpid.pidHex} · ${BAUD_RATE} baud`;
 
         updateStatus('Conectado al ESP32-C3', true);
         setConnectedUI(true);
 
         termWriteSystem('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-        termWriteSystem(`✓ Puerto abierto · VID=${vidHex} PID=${pidHex} · ${BAUD_RATE} baud 8N1`);
+        termWriteSystem(`✓ Puerto abierto · VID=${vidpid.vidHex} PID=${vidpid.pidHex}`);
+        if (mode === 'webusb') {
+            termWriteSystem(`  Interface=${usbInterface} · EP IN=0x${usbEpIn.toString(16)} OUT=0x${usbEpOut.toString(16)}`);
+        }
         termWriteSystem('Tip: dale a VERSION? para empezar');
         termWriteSystem('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
-        // Lanzar read loop en background usando el reader ya adquirido
         startReadLoop();
 
     } catch (err) {
-        if (err.name === 'NotFoundError') {
-            // El usuario canceló el picker
-            return;
-        }
+        if (err.name === 'NotFoundError') return;
         console.error(err);
         updateStatus('Error: ' + err.message, false);
         const banner = $('compatBanner');
@@ -216,71 +295,29 @@ async function connectSerial() {
     }
 }
 
-async function disconnectSerial() {
-    // 1. Marcar el loop para que salga
-    if (readLoopAbort) {
-        readLoopAbort.abort();
-        readLoopAbort = null;
-    }
-    // 2. Cancelar el reader (rompe cualquier read() pendiente)
-    if (reader) {
-        try { await reader.cancel(); } catch (_) {}
-        try { reader.releaseLock(); } catch (_) {}
-        reader = null;
-    }
-    // 3. Cerrar el writer (esperar a que se vacíe el buffer)
-    if (writer) {
-        try { await writer.close(); } catch (_) {}
-        try { writer.releaseLock(); } catch (_) {}
-        writer = null;
-    }
-    // 4. Cerrar el puerto
-    if (port) {
-        try { await port.close(); } catch (_) {}
-        port = null;
-    }
-    updateStatus('Desconectado', false);
-    setConnectedUI(false);
-    termWriteSystem('━━━ Desconectado ━━━');
-}
-
-/** Adquiere reader y writer al inicio de la sesión y los mantiene
- *  abiertos hasta disconnectSerial. Esto es crucial con el polyfill
- *  web-serial-polyfill: si hacemos getReader/releaseLock + getWriter/
- *  releaseLock alternados, el polyfill se confunde y cierra readable
- *  con done:true espontáneamente — eso es lo que hacía que el read
- *  loop muriera con "Read loop terminó: undefined". */
-function acquireStreams() {
-    reader = port.readable.getReader();
-    writer = port.writable.getWriter();
-}
-
-/** Read loop: escucha bytes del puerto y los pinta línea por línea
- *  en el terminal. Acumula en `lineBuffer` hasta encontrar \n.
- *  IMPORTANTE: NO hace getReader/releaseLock — usa el reader que
- *  acquireStreams() ya tiene activo durante toda la sesión.            */
+// ─── Read loop UNIFICADO (despacha por mode) ────────────────────────
 async function startReadLoop() {
     readLoopAbort = new AbortController();
+    if (mode === 'native') {
+        readLoopNative();
+    } else {
+        readLoopWebUSB();
+    }
+}
+
+async function readLoopNative() {
     const decoder = new TextDecoder();
     let lineBuffer = '';
-
     try {
         while (!readLoopAbort.signal.aborted) {
-            const result = await reader.read();
-            const { value, done } = result;
-
+            const { value, done } = await reader.read();
             if (done) {
-                // El stream se cerró (puerto desconectado o cerrado).
-                // En polyfill esto puede pasar por bug — registrarlo claro.
-                termWriteSystem('⚠ Stream cerrado por el navegador (done:true)');
+                termWriteSystem('⚠ Stream cerrado');
                 break;
             }
             if (!value) continue;
-
             const text = decoder.decode(value, { stream: true });
             lineBuffer += text;
-
-            // Procesar líneas completas
             let nlIdx;
             while ((nlIdx = lineBuffer.indexOf('\n')) !== -1) {
                 const line = lineBuffer.slice(0, nlIdx).replace(/\r$/, '');
@@ -289,23 +326,69 @@ async function startReadLoop() {
             }
         }
     } catch (err) {
-        if (err.name === 'AbortError') return;
-        // Loguear con detalle — antes salía "undefined" porque algunos
-        // errores del polyfill no son Error con .message
-        const msg = (err && err.message)
-            || (err && err.toString && err.toString())
-            || JSON.stringify(err)
-            || '(sin mensaje)';
-        console.error('Read loop error:', err);
-        termWriteSystem('⚠ Read loop terminó: ' + msg);
+        if (err.name !== 'AbortError') {
+            const msg = (err && err.message) || String(err);
+            termWriteSystem('⚠ Read loop nativo: ' + msg);
+        }
     }
 }
 
-/** Envía un comando al ESP32 (agrega CRLF y registra en historial).
- *  USA el writer ya adquirido por acquireStreams() — sin releaseLock,
- *  sin re-getWriter cada vez. */
+async function readLoopWebUSB() {
+    const decoder = new TextDecoder();
+    let lineBuffer = '';
+    try {
+        while (!readLoopAbort.signal.aborted) {
+            let result;
+            try {
+                // 64 bytes es el packet size estándar para CDC bulk IN.
+                // El USB-Serial-JTAG del C3 envía paquetes de 0 bytes
+                // como keep-alive — los ignoramos (ESTO es lo que rompía
+                // al polyfill).
+                result = await usbDevice.transferIn(usbEpIn, 64);
+            } catch (err) {
+                if (err.name === 'NotFoundError'
+                    || (err.message && err.message.includes('disconnect'))) {
+                    termWriteSystem('⚠ USB desconectado');
+                    break;
+                }
+                // stall u otro: intentar limpiar y seguir
+                try { await usbDevice.clearHalt('in', usbEpIn); } catch (_) {}
+                await new Promise(r => setTimeout(r, 50));
+                continue;
+            }
+
+            if (result.status === 'stall') {
+                try { await usbDevice.clearHalt('in', usbEpIn); } catch (_) {}
+                continue;
+            }
+            if (result.status !== 'ok') continue;
+            if (!result.data || result.data.byteLength === 0) continue;
+
+            // result.data es DataView — convertir a Uint8Array para TextDecoder
+            const chunk = new Uint8Array(result.data.buffer,
+                                         result.data.byteOffset,
+                                         result.data.byteLength);
+            const text = decoder.decode(chunk, { stream: true });
+            lineBuffer += text;
+
+            let nlIdx;
+            while ((nlIdx = lineBuffer.indexOf('\n')) !== -1) {
+                const line = lineBuffer.slice(0, nlIdx).replace(/\r$/, '');
+                lineBuffer = lineBuffer.slice(nlIdx + 1);
+                if (line.length > 0) termWriteRecv(line);
+            }
+        }
+    } catch (err) {
+        if (err.name !== 'AbortError') {
+            const msg = (err && err.message) || String(err);
+            termWriteSystem('⚠ Read loop WebUSB: ' + msg);
+        }
+    }
+}
+
+// ─── Send UNIFICADO ─────────────────────────────────────────────────
 async function sendCommand(cmd) {
-    if (!isConnected || !writer) {
+    if (!isConnected) {
         termWriteSystem('⚠ No conectado');
         return;
     }
@@ -314,11 +397,16 @@ async function sendCommand(cmd) {
 
     try {
         const encoder = new TextEncoder();
-        await writer.write(encoder.encode(trimmed + '\r\n'));
+        const data = encoder.encode(trimmed + '\r\n');
+
+        if (mode === 'native') {
+            await writer.write(data);
+        } else {
+            await usbDevice.transferOut(usbEpOut, data);
+        }
 
         termWriteSent(trimmed);
 
-        // Guardar en historial (sin duplicados consecutivos)
         if (cmdHistory[cmdHistory.length - 1] !== trimmed) {
             cmdHistory.push(trimmed);
             if (cmdHistory.length > 100) cmdHistory.shift();
@@ -331,11 +419,57 @@ async function sendCommand(cmd) {
     }
 }
 
-// ─── Confirmaciones para acciones destructivas ──────────────────────
-function confirmAndSend(cmd, message) {
-    if (confirm(message)) {
-        sendCommand(cmd);
+// ─── Disconnect ─────────────────────────────────────────────────────
+async function disconnectSerial() {
+    if (readLoopAbort) {
+        readLoopAbort.abort();
+        readLoopAbort = null;
     }
+
+    if (mode === 'native') {
+        if (reader) {
+            try { await reader.cancel(); } catch (_) {}
+            try { reader.releaseLock(); } catch (_) {}
+            reader = null;
+        }
+        if (writer) {
+            try { await writer.close(); } catch (_) {}
+            try { writer.releaseLock(); } catch (_) {}
+            writer = null;
+        }
+        if (port) {
+            try { await port.close(); } catch (_) {}
+            port = null;
+        }
+    } else if (mode === 'webusb' && usbDevice) {
+        try {
+            // SET_CONTROL_LINE_STATE a 0 — DTR=0 RTS=0
+            await usbDevice.controlTransferOut({
+                requestType: 'class',
+                recipient: 'interface',
+                request: 0x22,
+                value: 0x00,
+                index: usbCommInterface,
+            });
+        } catch (_) {}
+        try { await usbDevice.releaseInterface(usbInterface); } catch (_) {}
+        try { await usbDevice.close(); } catch (_) {}
+        usbDevice = null;
+        usbInterface = null;
+        usbCommInterface = null;
+        usbEpIn = null;
+        usbEpOut = null;
+    }
+
+    mode = null;
+    updateStatus('Desconectado', false);
+    setConnectedUI(false);
+    termWriteSystem('━━━ Desconectado ━━━');
+}
+
+// ─── Confirmaciones ─────────────────────────────────────────────────
+function confirmAndSend(cmd, message) {
+    if (confirm(message)) sendCommand(cmd);
 }
 
 // ─── Modal WIFI ─────────────────────────────────────────────────────
@@ -347,9 +481,7 @@ function openWifiModal() {
     $('wifiSsid').focus();
 }
 
-function closeWifiModal() {
-    $('wifiModal').style.display = 'none';
-}
+function closeWifiModal() { $('wifiModal').style.display = 'none'; }
 
 function updateWifiPreview() {
     const ssid = $('wifiSsid').value;
@@ -373,16 +505,13 @@ window.addEventListener('DOMContentLoaded', () => {
     initTerminal();
     checkCompatibility();
 
-    // Botón conectar/desconectar
     $('btnConnect').addEventListener('click', connectSerial);
     $('btnDisconnect').addEventListener('click', disconnectSerial);
 
-    // Quick commands (todos los que tienen data-cmd)
     document.querySelectorAll('[data-cmd]').forEach(btn => {
         btn.addEventListener('click', () => sendCommand(btn.dataset.cmd));
     });
 
-    // Quick commands con confirmación
     $('btnReset').addEventListener('click', () =>
         confirmAndSend('RESET', '¿Reiniciar el ESP32-C3? Va a desconectar el USB unos segundos.'));
     $('btnUsbReset').addEventListener('click', () =>
@@ -392,17 +521,15 @@ window.addEventListener('DOMContentLoaded', () => {
     $('btnWifiClear').addEventListener('click', () =>
         confirmAndSend('WIFI_CLEAR', '¿Borrar la configuración WiFi guardada? El ESP32 perderá la conexión hasta que reconfigures.'));
 
-    // WIFI configurar (modal)
     $('btnWifiSet').addEventListener('click', openWifiModal);
     $('wifiCancel').addEventListener('click', closeWifiModal);
     $('wifiSend').addEventListener('click', sendWifi);
     $('wifiSsid').addEventListener('input', updateWifiPreview);
     $('wifiPass').addEventListener('input', updateWifiPreview);
     $('wifiModal').addEventListener('click', (e) => {
-        if (e.target.id === 'wifiModal') closeWifiModal();  // click fuera cierra
+        if (e.target.id === 'wifiModal') closeWifiModal();
     });
 
-    // Input libre + Enter
     const cmdInput = $('cmdInput');
     cmdInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
@@ -433,10 +560,8 @@ window.addEventListener('DOMContentLoaded', () => {
         sendCommand(val);
     });
 
-    // Botones secundarios
     $('btnCopyLog').addEventListener('click', async () => {
         if (!term) return;
-        // Tomamos el buffer activo y construimos texto plano
         const buf = term.buffer.active;
         const lines = [];
         for (let i = 0; i < buf.length; i++) {
@@ -455,11 +580,9 @@ window.addEventListener('DOMContentLoaded', () => {
         if (term) term.clear();
     });
 
-    // Listeners de desconexión física — los registramos en ambos
-    // transportes para cubrir el caso nativo y el polyfill (WebUSB).
     if (hasNativeSerial) {
         navigator.serial.addEventListener('disconnect', () => {
-            if (isConnected) {
+            if (isConnected && mode === 'native') {
                 termWriteSystem('⚠ Puerto desconectado físicamente');
                 disconnectSerial();
             }
@@ -467,7 +590,7 @@ window.addEventListener('DOMContentLoaded', () => {
     }
     if (hasWebUSB) {
         navigator.usb.addEventListener('disconnect', () => {
-            if (isConnected) {
+            if (isConnected && mode === 'webusb') {
                 termWriteSystem('⚠ USB desconectado físicamente');
                 disconnectSerial();
             }
