@@ -8,7 +8,7 @@ Herramienta web para flashear firmware en microcontroladores **ESP32-C3** (USB-J
 
 ## Filosofía: poka-yoke
 
-A diferencia del [esptool-js oficial](https://espressif.github.io/esptool-js/), este flasher está diseñado para **prevenir errores humanos** en el flujo de Marco/operadores Kolonus:
+A diferencia del [esptool-js oficial](https://espressif.github.io/esptool-js/), este flasher está diseñado para **prevenir errores humanos** en el flujo de operadores Kolonus:
 
 - **Dropdown de firmwares pre-cargados** con offset embebido — el usuario NO escribe ningún `0x10000` manual (causa principal de bricking).
 - **🚨 Modo recuperación** explícito en el dropdown — para ESP32 brickeados (boot loop por bootloader corrupto).

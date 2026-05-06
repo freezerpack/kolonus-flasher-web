@@ -3,7 +3,7 @@
 //
 // Diferencias clave vs el oficial de esptool-js:
 //  - Dropdown de firmwares pre-cargados con offset embebido (poka-yoke):
-//    Marco selecciona "Kolonus QR Reader v1.3.8" y NO escribe ningún offset.
+//    el operador selecciona "Kolonus QR Reader v1.3.8" y NO escribe ningún offset.
 //  - "🚨 Modo recuperación" para ESP32 brickeados (boot loop por bootloader corrupto).
 //  - Baudrate forzado a 115200 (cambiar a 921600 falla con USB-CDC nativo del C3).
 //  - Modo avanzado oculto detrás de un toggle para los casos custom.
