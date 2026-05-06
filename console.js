@@ -1,4 +1,4 @@
-// Kolonus ESP32-C3 Console (Web Edition v1.2.0)
+// Kolonus ESP32-C3 Console (Web Edition v1.2.1)
 // https://github.com/freezerpack/kolonus-flasher-web
 //
 // Consola serial para hablar con el firmware del ESP32-C3 corriendo
@@ -109,7 +109,7 @@ function initTerminal() {
     fitAddon.fit();
     window.addEventListener('resize', () => fitAddon.fit());
 
-    termWriteSystem('Kolonus Console v1.2 — Conecta al ESP32-C3 para empezar');
+    termWriteSystem('Kolonus Console v1.2.1 — Conecta al ESP32-C3 para empezar');
     termWriteSystem('Tecla ↑/↓ para navegar el historial · Enter para enviar');
 }
 
@@ -150,8 +150,14 @@ function setConnectedUI(connected) {
     $('secondaryButtons').style.display = connected ? 'flex' : 'none';
 
     if (connected) {
+        // Re-fit del terminal ahora que es visible
         setTimeout(() => fitAddon && fitAddon.fit(), 50);
-        $('cmdInput').focus();
+        // NOTA: NO hacemos focus automático al cmdInput. En Android
+        // Chrome eso activa el teclado virtual y hace scroll automático,
+        // lo que provocaba que el primer tap a un quick-command se
+        // "consumiera" para desenfocar el input en lugar de ejecutar
+        // el comando. El usuario puede tocar el input manualmente
+        // cuando quiera teclear comando libre.
     }
 }
 
